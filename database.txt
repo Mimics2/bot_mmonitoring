@@ -1,0 +1,124 @@
+import sqlite3
+import json
+import logging
+from datetime import datetime
+
+class Database:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        """Инициализация базы данных"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Таблица пользователей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    session_string TEXT,
+                    keywords TEXT DEFAULT '[]',
+                    exceptions TEXT DEFAULT '[]',
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица разрешенных пользователей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    added_by INTEGER,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+    
+    def is_user_allowed(self, user_id):
+        """Проверка разрешен ли пользователь"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1 FROM allowed_users WHERE user_id = ?', (user_id,))
+            return cursor.fetchone() is not None
+    
+    def add_allowed_user(self, user_id, username, admin_id):
+        """Добавление разрешенного пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO allowed_users (user_id, username, added_by) 
+                VALUES (?, ?, ?)
+            ''', (user_id, username, admin_id))
+            conn.commit()
+    
+    def remove_allowed_user(self, user_id):
+        """Удаление разрешенного пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM allowed_users WHERE user_id = ?', (user_id,))
+            cursor.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+            conn.commit()
+    
+    def get_allowed_users(self):
+        """Получение списка разрешенных пользователей"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT au.user_id, au.username, u.username as tg_username, au.added_at 
+                FROM allowed_users au
+                LEFT JOIN users u ON au.user_id = u.user_id
+            ''')
+            return cursor.fetchall()
+    
+    def save_session(self, user_id, username, session_string):
+        """Сохранение сессии пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (user_id, username, session_string) 
+                VALUES (?, ?, ?)
+            ''', (user_id, username, session_string))
+            conn.commit()
+    
+    def get_user_session(self, user_id):
+        """Получение сессии пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT session_string FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            return result[0] if result else None
+    
+    def save_keywords(self, user_id, keywords, exceptions):
+        """Сохранение ключевых слов и исключений"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users SET keywords = ?, exceptions = ? 
+                WHERE user_id = ?
+            ''', (json.dumps(keywords), json.dumps(exceptions), user_id))
+            conn.commit()
+    
+    def get_user_settings(self, user_id):
+        """Получение настроек пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT keywords, exceptions FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            if result:
+                return json.loads(result[0]), json.loads(result[1])
+            return [], []
+    
+    def get_all_active_users(self):
+        """Получение всех активных пользователей"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT user_id, session_string, keywords, exceptions 
+                FROM users 
+                WHERE session_string IS NOT NULL AND is_active = 1
+            ''')
+            return cursor.fetchall()
