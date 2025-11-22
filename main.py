@@ -189,13 +189,10 @@ class SessionManager:
     def start_session(self, user_id, session_string):
         """Запуск одной сессии (синхронный метод)"""
         try:
-            # Создаем новый event loop для этого потока
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
+            # Останавливаем существующую сессию если есть
             if user_id in self.active_clients:
                 try:
-                    loop.run_until_complete(self.active_clients[user_id].disconnect())
+                    self.stop_session(user_id)
                 except:
                     pass
             
@@ -203,17 +200,26 @@ class SessionManager:
             from telethon.sessions import StringSession
             from telethon import events
             
-            client = TelegramClient(
-                StringSession(session_string),
-                self.api_id,
-                self.api_hash
-            )
+            # Создаем асинхронную функцию для запуска клиента
+            async def start_client():
+                client = TelegramClient(
+                    StringSession(session_string),
+                    self.api_id,
+                    self.api_hash
+                )
+                
+                await client.start()
+                return client
             
             # Запускаем клиента
-            loop.run_until_complete(client.start())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            client = loop.run_until_complete(start_client())
             
+            # Получаем настройки пользователя
             keywords, exceptions = self.db.get_user_settings(user_id)
             
+            # Создаем асинхронный обработчик сообщений
             @client.on(events.NewMessage)
             async def handler(event):
                 await self.handle_message(user_id, event, keywords, exceptions)
@@ -276,9 +282,14 @@ class SessionManager:
         """Остановка сессии (синхронный метод)"""
         if user_id in self.active_clients:
             try:
+                async def disconnect_client():
+                    await self.active_clients[user_id].disconnect()
+                
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(self.active_clients[user_id].disconnect())
+                loop.run_until_complete(disconnect_client())
+                loop.close()
+                
                 del self.active_clients[user_id]
                 logger.info(f"🛑 Сессия пользователя {user_id} остановлена")
             except Exception as e:
@@ -511,14 +522,27 @@ class MonitorBot:
             me = loop.run_until_complete(test_session())
             loop.close()
             
+            # Сохраняем сессию в базу
             self.db.save_session(user_id, username, session_string)
-            self.session_manager.start_session(user_id, session_string)
+            
+            # Запускаем мониторинг (отложенно, чтобы не блокировать ответ)
+            import threading
+            def start_monitoring():
+                try:
+                    self.session_manager.start_session(user_id, session_string)
+                except Exception as e:
+                    logger.error(f"Ошибка при запуске мониторинга: {e}")
+            
+            monitoring_thread = threading.Thread(target=start_monitoring)
+            monitoring_thread.daemon = True
+            monitoring_thread.start()
             
             update.message.reply_text(
                 f"✅ **Сессия успешно сохранена!**\n\n"
                 f"👤 Аккаунт: {me.first_name or ''}\n"
                 f"📱 Username: @{me.username or 'нет'}\n"
                 f"🆔 ID: `{me.id}`\n\n"
+                f"Мониторинг запускается в фоновом режиме...\n"
                 f"Теперь настройте фильтры для мониторинга.",
                 parse_mode='Markdown'
             )
@@ -565,7 +589,18 @@ class MonitorBot:
         
         _, exceptions = self.db.get_user_settings(user_id)
         self.db.save_keywords(user_id, keywords, exceptions)
-        self.session_manager.restart_session(user_id)
+        
+        # Перезапускаем сессию с новыми настройками в фоне
+        import threading
+        def restart_monitoring():
+            try:
+                self.session_manager.restart_session(user_id)
+            except Exception as e:
+                logger.error(f"Ошибка при перезапуске мониторинга: {e}")
+        
+        monitoring_thread = threading.Thread(target=restart_monitoring)
+        monitoring_thread.daemon = True
+        monitoring_thread.start()
         
         update.message.reply_text(f"✅ **Ключевые слова сохранены!**\n\nСписок: {', '.join(keywords)}\n\nВсего слов: {len(keywords)}")
     
@@ -582,7 +617,18 @@ class MonitorBot:
         
         keywords, _ = self.db.get_user_settings(user_id)
         self.db.save_keywords(user_id, keywords, exceptions)
-        self.session_manager.restart_session(user_id)
+        
+        # Перезапускаем сессию с новыми настройками в фоне
+        import threading
+        def restart_monitoring():
+            try:
+                self.session_manager.restart_session(user_id)
+            except Exception as e:
+                logger.error(f"Ошибка при перезапуске мониторинга: {e}")
+        
+        monitoring_thread = threading.Thread(target=restart_monitoring)
+        monitoring_thread.daemon = True
+        monitoring_thread.start()
         
         update.message.reply_text(f"✅ **Исключения сохранены!**\n\nСписок: {', '.join(exceptions) if exceptions else 'нет исключений'}\n\nВсего исключений: {len(exceptions)}")
     
@@ -592,10 +638,12 @@ class MonitorBot:
         keywords, exceptions = self.db.get_user_settings(user_id)
         
         status = "🟢 Активен" if session_string else "🔴 Неактивен"
+        monitoring_status = "🟢 Запущен" if user_id in self.session_manager.active_clients else "🔴 Не запущен"
         
         text = (
             "📊 **Статус мониторинга**\n\n"
             f"🔄 Статус: {status}\n"
+            f"📡 Мониторинг: {monitoring_status}\n"
             f"🔍 Ключевых слов: {len(keywords)}\n"
             f"🚫 Исключений: {len(exceptions)}\n\n"
             f"*Сессия: {'✅ Загружена' if session_string else '❌ Отсутствует'}*"
