@@ -190,23 +190,27 @@ class SessionManager:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
-            client = TelegramClient(
-                StringSession(session_string),
-                self.api_id,
-                self.api_hash,
-                loop=loop
-            )
+            # Создаем асинхронную функцию для запуска
+            async def start_client():
+                client = TelegramClient(
+                    StringSession(session_string),
+                    self.api_id,
+                    self.api_hash
+                )
+                await client.start()
+                
+                # Получаем настройки пользователя
+                keywords, exceptions = self.db.get_user_settings(user_id)
+                
+                # Настраиваем обработчик
+                @client.on(events.NewMessage)
+                async def handler(event):
+                    await self.handle_message(user_id, event, keywords, exceptions)
+                
+                return client
             
             # Запускаем клиента
-            loop.run_until_complete(client.start())
-            
-            # Получаем настройки пользователя
-            keywords, exceptions = self.db.get_user_settings(user_id)
-            
-            # Настраиваем обработчик
-            @client.on(events.NewMessage)
-            async def handler(event):
-                await self.handle_message(user_id, event, keywords, exceptions)
+            client = loop.run_until_complete(start_client())
             
             self.active_clients[user_id] = {
                 'client': client,
@@ -265,22 +269,6 @@ class SessionManager:
                 logger.info(f"📨 Сообщение переслано пользователю {user_id}")
             except Exception as e:
                 logger.error(f"❌ Ошибка отправки сообщения: {e}")
-                # Если сообщение слишком длинное, разбиваем на части
-                if len(full_message) > 4096:
-                    info_part = (
-                        f"🔔 **Найдено совпадение!**\n\n"
-                        f"👤 **От:** {sender_username} ({sender_name})\n"
-                        f"🆔 **ID:** `{sender_id}`\n"
-                        f"📋 **Чат:** {chat_title}\n"
-                        f"📅 **Время:** {message.date.strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-                    self.bot.send_message(user_id, info_part, parse_mode='Markdown')
-                    
-                    # Отправляем текст сообщения частями
-                    message_text = message.text
-                    for i in range(0, len(message_text), 4000):
-                        chunk = message_text[i:i + 4000]
-                        self.bot.send_message(user_id, f"📝 **Текст:**\n{chunk}")
                 
         except Exception as e:
             logger.error(f"❌ Ошибка обработки сообщения: {e}")
@@ -294,12 +282,13 @@ class SessionManager:
                 loop = client_data['loop']
                 
                 # Останавливаем клиента
-                if client.is_connected():
-                    loop.run_until_complete(client.disconnect())
+                async def disconnect():
+                    await client.disconnect()
+                
+                loop.run_until_complete(disconnect())
                 
                 # Закрываем loop
                 if not loop.is_closed():
-                    loop.stop()
                     loop.close()
                 
                 del self.active_clients[user_id]
@@ -410,6 +399,31 @@ class MonitorBot:
             reply_markup=reply_markup
         )
     
+    def start_callback_command(self, query, context):
+        """Обработчик команды /start для callback"""
+        user_id = query.from_user.id
+        username = query.from_user.username or "Unknown"
+        
+        logger.info(f"📩 /start от {user_id} (callback)")
+        
+        if user_id in ADMINS:
+            self.db.add_allowed_user(user_id, username, user_id)
+        
+        if not self.db.is_user_allowed(user_id):
+            query.message.reply_text("❌ Доступ запрещен. Используйте /debug")
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("📤 Загрузить сессию", callback_data="upload_session")],
+            [InlineKeyboardButton("⚙️ Настройки фильтров", callback_data="settings")],
+            [InlineKeyboardButton("📊 Статус", callback_data="status")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        query.message.reply_text(
+            "👋 **Добро пожаловать в мониторинг Telegram!**\n\nВыберите действие:",
+            reply_markup=reply_markup
+        )
+    
     def admin_command(self, update: Update, context: CallbackContext):
         """Обработчик команды /admin"""
         user_id = update.effective_user.id
@@ -425,6 +439,26 @@ class MonitorBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         update.message.reply_text(
+            "🛠️ **Админ панель**\n\nВыберите действие:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    
+    def admin_callback_command(self, query, context):
+        """Обработчик команды /admin для callback"""
+        user_id = query.from_user.id
+        
+        if user_id not in ADMINS:
+            query.message.reply_text("❌ У вас нет прав администратора.")
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("👥 Управление пользователями", callback_data="admin_users")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton("🔄 Перезапуск сессий", callback_data="admin_restart")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        query.message.reply_text(
             "🛠️ **Админ панель**\n\nВыберите действие:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
@@ -472,7 +506,7 @@ class MonitorBot:
         elif data == "set_exceptions":
             self.set_exceptions(query, context)
         elif data == "back_to_main":
-            self.start_command(update, context)
+            self.start_callback_command(query, context)
         elif data == "admin_users":
             self.admin_users(query)
         elif data == "admin_stats":
@@ -480,7 +514,7 @@ class MonitorBot:
         elif data == "admin_restart":
             self.admin_restart(query)
         elif data == "admin_back":
-            self.admin_command(update, context)
+            self.admin_callback_command(query, context)
         elif data == "admin_add_user":
             self.admin_add_user_dialog(query, context)
         elif data.startswith("admin_remove_user:"):
@@ -504,7 +538,11 @@ class MonitorBot:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             
-            # Проверяем сессию
+            # Создаем отдельный loop для проверки сессии
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Асинхронная функция для проверки сессии
             async def test_session():
                 client = TelegramClient(
                     StringSession(session_string),
@@ -516,23 +554,30 @@ class MonitorBot:
                 await client.disconnect()
                 return me
             
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Проверяем сессию
             me = loop.run_until_complete(test_session())
             loop.close()
             
             # Сохраняем в базу
             self.db.save_session(user_id, username, session_string)
             
-            # Запускаем мониторинг
-            self.session_manager.start_session(user_id, session_string)
+            # Запускаем мониторинг в фоновом режиме
+            import threading
+            def start_monitoring():
+                try:
+                    self.session_manager.start_session(user_id, session_string)
+                except Exception as e:
+                    logger.error(f"Ошибка запуска мониторинга: {e}")
+            
+            thread = threading.Thread(target=start_monitoring, daemon=True)
+            thread.start()
             
             update.message.reply_text(
                 f"✅ **Сессия сохранена!**\n\n"
                 f"👤 Аккаунт: {me.first_name or ''}\n"
                 f"📱 Username: @{me.username or 'нет'}\n"
                 f"🆔 ID: `{me.id}`\n\n"
-                f"Мониторинг запущен!\n"
+                f"Мониторинг запускается...\n"
                 f"Теперь настройте фильтры.",
                 parse_mode='Markdown'
             )
