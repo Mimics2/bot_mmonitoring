@@ -25,12 +25,13 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_ID = int(os.getenv('API_ID', '2040'))
 API_HASH = os.getenv('API_HASH', 'b18441a1ff607e10a989891a5462e627')
-ADMINS = [int(x.strip()) for x in os.getenv('ADMINS', '').split(',') if x.strip()]
+ADMINS_STR = os.getenv('ADMINS', '')
+ADMINS = [int(x.strip()) for x in ADMINS_STR.split(',') if x.strip()] if ADMINS_STR else []
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен в переменных окружения Realway")
 
-logger.info("Конфигурация загружена успешно")
+logger.info(f"Конфигурация загружена успешно. Админы: {ADMINS}")
 
 class Database:
     def __init__(self, db_path="users_data.db"):
@@ -62,14 +63,38 @@ class Database:
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Автоматически добавляем админов из переменной окружения
+            for admin_id in ADMINS:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO allowed_users (user_id, username, added_by) 
+                    VALUES (?, ?, ?)
+                ''', (admin_id, f"admin_{admin_id}", 0))
+            
             conn.commit()
-        logger.info("База данных инициализирована")
+        
+        # Логируем всех пользователей после инициализации
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id, username FROM allowed_users')
+            users = cursor.fetchall()
+            logger.info(f"Пользователи в белом списке после инициализации: {users}")
     
     def is_user_allowed(self, user_id):
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM allowed_users WHERE user_id = ?', (user_id,))
-            return cursor.fetchone() is not None
+            cursor.execute('SELECT user_id FROM allowed_users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            
+            # Получаем всех пользователей для отладки
+            cursor.execute('SELECT user_id, username FROM allowed_users')
+            all_users = cursor.fetchall()
+            
+            logger.info(f"🔐 Проверка доступа для user_id: {user_id}")
+            logger.info(f"📋 Все пользователи в белом списке: {all_users}")
+            logger.info(f"✅ Результат проверки: {'ДОСТУП РАЗРЕШЕН' if result else 'ДОСТУП ЗАПРЕЩЕН'}")
+            
+            return result is not None
     
     def add_allowed_user(self, user_id, username, admin_id):
         with self.get_connection() as conn:
@@ -79,7 +104,7 @@ class Database:
                 VALUES (?, ?, ?)
             ''', (user_id, username, admin_id))
             conn.commit()
-        logger.info(f"Пользователь {user_id} добавлен админом {admin_id}")
+        logger.info(f"✅ Пользователь {user_id} (@{username}) добавлен админом {admin_id}")
     
     def remove_allowed_user(self, user_id):
         with self.get_connection() as conn:
@@ -87,7 +112,7 @@ class Database:
             cursor.execute('DELETE FROM allowed_users WHERE user_id = ?', (user_id,))
             cursor.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
             conn.commit()
-        logger.info(f"Пользователь {user_id} удален")
+        logger.info(f"❌ Пользователь {user_id} удален")
     
     def get_allowed_users(self):
         with self.get_connection() as conn:
@@ -103,7 +128,7 @@ class Database:
                 VALUES (?, ?, ?)
             ''', (user_id, username, session_string))
             conn.commit()
-        logger.info(f"Сессия сохранена для пользователя {user_id}")
+        logger.info(f"💾 Сессия сохранена для пользователя {user_id}")
     
     def get_user_session(self, user_id):
         with self.get_connection() as conn:
@@ -120,7 +145,7 @@ class Database:
                 WHERE user_id = ?
             ''', (json.dumps(keywords), json.dumps(exceptions), user_id))
             conn.commit()
-        logger.info(f"Фильтры обновлены для пользователя {user_id}")
+        logger.info(f"⚙️ Фильтры обновлены для пользователя {user_id}")
     
     def get_user_settings(self, user_id):
         with self.get_connection() as conn:
@@ -154,13 +179,13 @@ class SessionManager:
         """Запуск всех сессий (синхронный метод)"""
         try:
             users = self.db.get_all_active_users()
-            logger.info(f"Найдено {len(users)} пользователей для запуска")
+            logger.info(f"🔄 Найдено {len(users)} пользователей для запуска")
             
             for user_id, session_string, keywords_json, exceptions_json in users:
                 self.start_session(user_id, session_string)
                 
         except Exception as e:
-            logger.error(f"Ошибка запуска сессий: {e}")
+            logger.error(f"❌ Ошибка запуска сессий: {e}")
     
     def start_session(self, user_id, session_string):
         """Запуск одной сессии (синхронный метод)"""
@@ -192,10 +217,10 @@ class SessionManager:
                 await self.handle_message(user_id, event, keywords, exceptions)
             
             self.active_clients[user_id] = client
-            logger.info(f"Сессия для пользователя {user_id} запущена")
+            logger.info(f"✅ Сессия для пользователя {user_id} запущена")
             
         except Exception as e:
-            logger.error(f"Ошибка запуска сессии для {user_id}: {e}")
+            logger.error(f"❌ Ошибка запуска сессии для {user_id}: {e}")
             try:
                 self.bot.send_message(
                     user_id, 
@@ -240,10 +265,10 @@ class SessionManager:
             )
             
             self.bot.send_message(user_id, alert_message, parse_mode='Markdown')
-            logger.info(f"Отправлено уведомление пользователю {user_id}")
+            logger.info(f"📨 Отправлено уведомление пользователю {user_id}")
             
         except Exception as e:
-            logger.error(f"Ошибка обработки сообщения: {e}")
+            logger.error(f"❌ Ошибка обработки сообщения: {e}")
     
     def stop_session(self, user_id):
         """Остановка сессии (синхронный метод)"""
@@ -251,9 +276,9 @@ class SessionManager:
             try:
                 self.loop.run_until_complete(self.active_clients[user_id].disconnect())
                 del self.active_clients[user_id]
-                logger.info(f"Сессия пользователя {user_id} остановлена")
+                logger.info(f"🛑 Сессия пользователя {user_id} остановлена")
             except Exception as e:
-                logger.error(f"Ошибка остановки сессии {user_id}: {e}")
+                logger.error(f"❌ Ошибка остановки сессии {user_id}: {e}")
     
     def restart_session(self, user_id):
         """Перезапуск сессии (синхронный метод)"""
@@ -269,7 +294,7 @@ class MonitorBot:
     
     def start(self):
         try:
-            logger.info("Запуск бота на Realway...")
+            logger.info("🚀 Запуск бота на Realway...")
             
             self.updater = Updater(BOT_TOKEN, use_context=True)
             self.session_manager = SessionManager(API_ID, API_HASH, self.db, self.updater.bot)
@@ -280,12 +305,12 @@ class MonitorBot:
             self.session_manager.start_all_sessions()
             
             # Запускаем бота
-            logger.info("Бот запущен в режиме polling...")
+            logger.info("🤖 Бот запущен в режиме polling...")
             self.updater.start_polling()
             self.updater.idle()
                 
         except Exception as e:
-            logger.error(f"Критическая ошибка при запуске: {e}")
+            logger.error(f"💥 Критическая ошибка при запуске: {e}")
             raise
     
     def setup_handlers(self):
@@ -294,17 +319,63 @@ class MonitorBot:
         # Все обработчики теперь синхронные
         dp.add_handler(CommandHandler("start", self.start_command))
         dp.add_handler(CommandHandler("admin", self.admin_command))
+        dp.add_handler(CommandHandler("debug", self.debug_command))  # Команда для отладки
         dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
         dp.add_handler(CallbackQueryHandler(self.handle_callback))
         dp.add_error_handler(self.error_handler)
     
+    def debug_command(self, update: Update, context: CallbackContext):
+        """Команда для отладки - показывает информацию о пользователе"""
+        user_id = update.effective_user.id
+        username = update.effective_user.username or "Нет username"
+        first_name = update.effective_user.first_name or "Нет имени"
+        
+        # Принудительно добавляем пользователя если он админ
+        if user_id in ADMINS:
+            self.db.add_allowed_user(user_id, username, user_id)
+            status = "✅ АДМИН (добавлен в белый список)"
+        else:
+            status = "❌ НЕ АДМИН"
+        
+        # Проверяем доступ
+        is_allowed = self.db.is_user_allowed(user_id)
+        
+        debug_info = (
+            f"🔧 **Информация для отладки:**\n\n"
+            f"🆔 **Ваш ID:** `{user_id}`\n"
+            f"👤 **Username:** @{username}\n"
+            f"📛 **Имя:** {first_name}\n"
+            f"👑 **Статус:** {status}\n"
+            f"🔐 **В белом списке:** {'✅ ДА' if is_allowed else '❌ НЕТ'}\n"
+            f"📋 **Все админы из .env:** {ADMINS}\n\n"
+        )
+        
+        if not is_allowed and user_id in ADMINS:
+            debug_info += "⚠️ **Проблема:** Вы в ADMINS но не в белом списке. Добавляем...\n"
+            self.db.add_allowed_user(user_id, username, user_id)
+            debug_info += "✅ **Исправлено:** Вы добавлены в белый список!\n"
+        
+        update.message.reply_text(debug_info, parse_mode='Markdown')
+    
     def start_command(self, update: Update, context: CallbackContext):
         """Синхронный обработчик команды /start"""
         user_id = update.effective_user.id
+        username = update.effective_user.username or "Unknown"
+        
+        logger.info(f"📩 Получена команда /start от user_id: {user_id}, username: @{username}")
+        
+        # Автоматически добавляем админов если их нет в белом списке
+        if user_id in ADMINS:
+            logger.info(f"👑 Обнаружен админ: {user_id}, добавляем в белый список...")
+            self.db.add_allowed_user(user_id, username, user_id)
         
         if not self.db.is_user_allowed(user_id):
             update.message.reply_text(
-                "❌ Доступ запрещен.\nОбратитесь к администратору для получения доступа."
+                f"❌ **Доступ запрещен**\n\n"
+                f"🆔 **Ваш ID:** `{user_id}`\n"
+                f"👤 **Username:** @{username}\n\n"
+                f"Обратитесь к администратору для получения доступа.\n"
+                f"Используйте /debug для подробной информации."
             )
             return
         
@@ -316,7 +387,8 @@ class MonitorBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         update.message.reply_text(
-            "👋 Добро пожаловать в мониторинг Telegram!\n\nВыберите действие:",
+            "👋 **Добро пожаловать в мониторинг Telegram!**\n\n"
+            "Выберите действие:",
             reply_markup=reply_markup
         )
     
@@ -583,7 +655,7 @@ class MonitorBot:
         query.edit_message_text("✅ Все сессии перезапущены!")
     
     def error_handler(self, update: Update, context: CallbackContext):
-        logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+        logger.error(f"❌ Ошибка: {context.error}", exc_info=context.error)
 
 def main():
     bot = MonitorBot()
