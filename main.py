@@ -1,22 +1,27 @@
 import logging
 import asyncio
+import sys
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, 
     ContextTypes, filters
 )
 import json
-import re
 
-from config import BOT_TOKEN, API_ID, API_HASH, ADMINS
+from config import BOT_TOKEN, API_ID, API_HASH, ADMINS, WEBHOOK_URL, PORT
 from database import Database
 from session_manager import SessionManager
 
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log', encoding='utf-8')
+    ]
 )
+logger = logging.getLogger(__name__)
 
 class MonitorBot:
     def __init__(self):
@@ -26,30 +31,55 @@ class MonitorBot:
     
     async def start(self):
         """Запуск бота"""
-        self.application = Application.builder().token(BOT_TOKEN).build()
-        self.session_manager = SessionManager(API_ID, API_HASH, self.db, self.application.bot)
-        
-        # Обработчики команд
+        try:
+            logger.info("Запуск бота...")
+            
+            # Создаем приложение
+            self.application = Application.builder().token(BOT_TOKEN).build()
+            self.session_manager = SessionManager(API_ID, API_HASH, self.db, self.application.bot)
+            
+            # Добавляем обработчики
+            self.setup_handlers()
+            
+            # Запускаем сессии
+            await self.session_manager.start_all_sessions()
+            
+            # Запускаем бота
+            if WEBHOOK_URL:
+                await self.start_webhook()
+            else:
+                await self.application.run_polling()
+                
+        except Exception as e:
+            logger.error(f"Критическая ошибка при запуске: {e}")
+            raise
+    
+    def setup_handlers(self):
+        """Настройка обработчиков"""
+        # Команды
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("admin", self.admin_command))
         
-        # Обработчики сообщений
+        # Сообщения
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
         
-        # Запуск сессий
-        await self.session_manager.start_all_sessions()
+        # Обработка ошибок
+        self.application.add_error_handler(self.error_handler)
+    
+    async def start_webhook(self):
+        """Запуск вебхука"""
+        await self.application.bot.set_webhook(
+            url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+            allowed_updates=Update.ALL_TYPES
+        )
         
-        # Запуск бота
-        if WEBHOOK_URL:
-            await self.application.start_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=BOT_TOKEN,
-                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-            )
-        else:
-            await self.application.run_polling()
+        # Для Realway обычно используется порт из переменной окружения
+        await self.application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        )
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -91,8 +121,7 @@ class MonitorBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "🛠️ **Админ панель**\n\n"
-            "Выберите действие:",
+            "🛠️ **Админ панель**\n\nВыберите действие:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
@@ -105,22 +134,22 @@ class MonitorBot:
         if not self.db.is_user_allowed(user_id):
             return
         
-        # Проверяем состояние пользователя
         user_state = context.user_data.get('state')
         
         if user_state == 'waiting_session':
-            # Сохраняем сессию
             await self.save_session(update, text)
             context.user_data['state'] = None
             
         elif user_state == 'waiting_keywords':
-            # Сохраняем ключевые слова
             await self.save_keywords(update, text)
             context.user_data['state'] = None
             
         elif user_state == 'waiting_exceptions':
-            # Сохраняем исключения
             await self.save_exceptions(update, text)
+            context.user_data['state'] = None
+            
+        elif user_state == 'admin_waiting_user':
+            await self.admin_add_user(update, text)
             context.user_data['state'] = None
     
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,33 +160,38 @@ class MonitorBot:
         user_id = query.from_user.id
         data = query.data
         
+        # Основные команды
         if data == "upload_session":
-            await self.upload_session(query)
+            await self.upload_session(query, context)
         elif data == "settings":
             await self.show_settings(query)
         elif data == "status":
             await self.show_status(query)
         elif data == "set_keywords":
-            await self.set_keywords(query)
+            await self.set_keywords(query, context)
         elif data == "set_exceptions":
-            await self.set_exceptions(query)
+            await self.set_exceptions(query, context)
+        elif data == "back_to_main":
+            await self.start_command(query, context)
+            
+        # Админ команды
         elif data == "admin_users":
             await self.admin_users(query)
         elif data == "admin_stats":
             await self.admin_stats(query)
         elif data == "admin_restart":
             await self.admin_restart(query)
-        elif data.startswith("admin_add_user"):
-            await self.admin_add_user_dialog(query)
+        elif data == "admin_back":
+            await self.admin_command(query, context)
+        elif data == "admin_add_user":
+            await self.admin_add_user_dialog(query, context)
         elif data.startswith("admin_remove_user:"):
             target_user_id = int(data.split(":")[1])
             await self.admin_remove_user(query, target_user_id)
     
-    async def upload_session(self, query):
+    async def upload_session(self, query, context):
         """Загрузка сессии"""
-        context = query._context
         context.user_data['state'] = 'waiting_session'
-        
         await query.edit_message_text(
             "📤 **Загрузка сессии**\n\n"
             "Отправьте строку сессии в следующем сообщении.\n"
@@ -225,11 +259,9 @@ class MonitorBot:
         
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
     
-    async def set_keywords(self, query):
+    async def set_keywords(self, query, context):
         """Установка ключевых слов"""
-        context = query._context
         context.user_data['state'] = 'waiting_keywords'
-        
         await query.edit_message_text(
             "🔍 **Настройка ключевых слов**\n\n"
             "Отправьте список ключевых слов через запятую:\n"
@@ -243,13 +275,8 @@ class MonitorBot:
         user_id = update.effective_user.id
         keywords = [kw.strip() for kw in text.split(',') if kw.strip()]
         
-        # Получаем текущие исключения
         _, exceptions = self.db.get_user_settings(user_id)
-        
-        # Сохраняем настройки
         self.db.save_keywords(user_id, keywords, exceptions)
-        
-        # Перезапускаем сессию с новыми настройками
         await self.session_manager.restart_session(user_id)
         
         await update.message.reply_text(
@@ -258,11 +285,9 @@ class MonitorBot:
             f"Всего слов: {len(keywords)}"
         )
     
-    async def set_exceptions(self, query):
+    async def set_exceptions(self, query, context):
         """Установка исключений"""
-        context = query._context
         context.user_data['state'] = 'waiting_exceptions'
-        
         await query.edit_message_text(
             "🚫 **Настройка исключений**\n\n"
             "Отправьте список слов-исключений через запятую:\n"
@@ -276,13 +301,8 @@ class MonitorBot:
         user_id = update.effective_user.id
         exceptions = [ex.strip() for ex in text.split(',') if ex.strip()]
         
-        # Получаем текущие ключевые слова
         keywords, _ = self.db.get_user_settings(user_id)
-        
-        # Сохраняем настройки
         self.db.save_keywords(user_id, keywords, exceptions)
-        
-        # Перезапускаем сессию с новыми настройками
         await self.session_manager.restart_session(user_id)
         
         await update.message.reply_text(
@@ -312,7 +332,7 @@ class MonitorBot:
         
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
     
-    # АДМИН ФУНКЦИИ
+    # Админ функции
     async def admin_users(self, query):
         """Управление пользователями"""
         users = self.db.get_allowed_users()
@@ -322,7 +342,7 @@ class MonitorBot:
         if not users:
             text += "Нет разрешенных пользователей."
         else:
-            for user_id, username, tg_username, added_at in users:
+            for user_id, username, added_at in users:
                 text += f"🆔 {user_id} | @{username or 'нет'}\n"
         
         keyboard = [
@@ -330,9 +350,8 @@ class MonitorBot:
             [InlineKeyboardButton("🔙 Назад", callback_data="admin_back")]
         ]
         
-        # Добавляем кнопки удаления для каждого пользователя
-        for user_id, username, _, _ in users:
-            if user_id != query.from_user.id:  # Нельзя удалить себя
+        for user_id, username, _ in users:
+            if user_id != query.from_user.id:
                 keyboard.append([InlineKeyboardButton(
                     f"❌ Удалить {user_id}", 
                     callback_data=f"admin_remove_user:{user_id}"
@@ -341,22 +360,33 @@ class MonitorBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
     
-    async def admin_add_user_dialog(self, query):
+    async def admin_add_user_dialog(self, query, context):
         """Диалог добавления пользователя"""
-        context = query._context
-        context.user_data['admin_state'] = 'waiting_user_id'
-        
+        context.user_data['state'] = 'admin_waiting_user'
         await query.edit_message_text(
             "➕ **Добавление пользователя**\n\n"
-            "Отправьте user_id пользователя, которого хотите добавить:\n\n"
-            "⚠️ *Пользователь должен сначала начать диалог с ботом*"
+            "Отправьте user_id пользователя, которого хотите добавить:"
         )
+    
+    async def admin_add_user(self, update, text):
+        """Добавление пользователя"""
+        try:
+            target_user_id = int(text.strip())
+            admin_id = update.effective_user.id
+            username = update.effective_user.username or "Unknown"
+            
+            self.db.add_allowed_user(target_user_id, username, admin_id)
+            await update.message.reply_text(f"✅ Пользователь {target_user_id} добавлен!")
+            
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат user_id!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def admin_remove_user(self, query, target_user_id):
         """Удаление пользователя"""
         self.db.remove_allowed_user(target_user_id)
         await self.session_manager.stop_session(target_user_id)
-        
         await query.edit_message_text(f"✅ Пользователь {target_user_id} удален!")
     
     async def admin_stats(self, query):
@@ -380,6 +410,10 @@ class MonitorBot:
         """Перезапуск всех сессий"""
         await self.session_manager.start_all_sessions()
         await query.edit_message_text("✅ Все сессии перезапущены!")
+    
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ошибок"""
+        logger.error(f"Ошибка: {context.error}", exc_info=context.error)
 
 async def main():
     """Основная функция"""
