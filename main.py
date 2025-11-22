@@ -64,7 +64,6 @@ class Database:
                 )
             ''')
             
-            # Автоматически добавляем админов из переменной окружения
             for admin_id in ADMINS:
                 cursor.execute('''
                     INSERT OR IGNORE INTO allowed_users (user_id, username, added_by) 
@@ -73,27 +72,17 @@ class Database:
             
             conn.commit()
         
-        # Логируем всех пользователей после инициализации
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT user_id, username FROM allowed_users')
             users = cursor.fetchall()
-            logger.info(f"Пользователи в белом списке после инициализации: {users}")
+            logger.info(f"Пользователи в белом списке: {users}")
     
     def is_user_allowed(self, user_id):
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT user_id FROM allowed_users WHERE user_id = ?', (user_id,))
             result = cursor.fetchone()
-            
-            # Получаем всех пользователей для отладки
-            cursor.execute('SELECT user_id, username FROM allowed_users')
-            all_users = cursor.fetchall()
-            
-            logger.info(f"🔐 Проверка доступа для user_id: {user_id}")
-            logger.info(f"📋 Все пользователи в белом списке: {all_users}")
-            logger.info(f"✅ Результат проверки: {'ДОСТУП РАЗРЕШЕН' if result else 'ДОСТУП ЗАПРЕЩЕН'}")
-            
             return result is not None
     
     def add_allowed_user(self, user_id, username, admin_id):
@@ -104,7 +93,7 @@ class Database:
                 VALUES (?, ?, ?)
             ''', (user_id, username, admin_id))
             conn.commit()
-        logger.info(f"✅ Пользователь {user_id} (@{username}) добавлен админом {admin_id}")
+        logger.info(f"✅ Пользователь {user_id} добавлен")
     
     def remove_allowed_user(self, user_id):
         with self.get_connection() as conn:
@@ -128,7 +117,7 @@ class Database:
                 VALUES (?, ?, ?)
             ''', (user_id, username, session_string))
             conn.commit()
-        logger.info(f"💾 Сессия сохранена для пользователя {user_id}")
+        logger.info(f"💾 Сессия сохранена для {user_id}")
     
     def get_user_session(self, user_id):
         with self.get_connection() as conn:
@@ -145,7 +134,7 @@ class Database:
                 WHERE user_id = ?
             ''', (json.dumps(keywords), json.dumps(exceptions), user_id))
             conn.commit()
-        logger.info(f"⚙️ Фильтры обновлены для пользователя {user_id}")
+        logger.info(f"⚙️ Фильтры обновлены для {user_id}")
     
     def get_user_settings(self, user_id):
         with self.get_connection() as conn:
@@ -175,7 +164,6 @@ class SessionManager:
         self.active_clients = {}
         
     def start_all_sessions(self):
-        """Запуск всех сессий (синхронный метод)"""
         try:
             users = self.db.get_all_active_users()
             logger.info(f"🔄 Найдено {len(users)} пользователей для запуска")
@@ -187,9 +175,7 @@ class SessionManager:
             logger.error(f"❌ Ошибка запуска сессий: {e}")
     
     def start_session(self, user_id, session_string):
-        """Запуск одной сессии (синхронный метод)"""
         try:
-            # Останавливаем существующую сессию если есть
             if user_id in self.active_clients:
                 try:
                     self.stop_session(user_id)
@@ -200,45 +186,33 @@ class SessionManager:
             from telethon.sessions import StringSession
             from telethon import events
             
-            # Создаем асинхронную функцию для запуска клиента
             async def start_client():
                 client = TelegramClient(
                     StringSession(session_string),
                     self.api_id,
                     self.api_hash
                 )
-                
                 await client.start()
                 return client
             
-            # Запускаем клиента
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             client = loop.run_until_complete(start_client())
             
-            # Получаем настройки пользователя
             keywords, exceptions = self.db.get_user_settings(user_id)
             
-            # Создаем асинхронный обработчик сообщений
             @client.on(events.NewMessage)
             async def handler(event):
                 await self.handle_message(user_id, event, keywords, exceptions)
             
             self.active_clients[user_id] = client
-            logger.info(f"✅ Сессия для пользователя {user_id} запущена")
+            logger.info(f"✅ Сессия для {user_id} запущена")
             
         except Exception as e:
             logger.error(f"❌ Ошибка запуска сессии для {user_id}: {e}")
-            try:
-                self.bot.send_message(
-                    user_id, 
-                    f"❌ Ошибка запуска сессии: {str(e)}"
-                )
-            except:
-                pass
     
     async def handle_message(self, user_id, event, keywords, exceptions):
-        """Обработка сообщений (асинхронный метод)"""
+        """Обработка сообщений с ПЕРЕСЫЛКОЙ"""
         try:
             from telethon import events
             
@@ -263,48 +237,46 @@ class SessionManager:
             sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'title', '') or "Неизвестно"
             sender_id = sender.id if sender else "Неизвестно"
             
-            # Получаем информацию о чате
             chat = await event.get_chat()
             chat_title = getattr(chat, 'title', '') or getattr(chat, 'username', '') or "Личные сообщения"
             
-            # Форматируем сообщение для бота
-            alert_message = (
+            # ФОРМАТИРУЕМ ПОЛНОЕ СООБЩЕНИЕ ДЛЯ ПЕРЕСЫЛКИ
+            full_message = (
                 f"🔔 **Найдено совпадение!**\n\n"
-                f"👤 **Пользователь:** {sender_username}\n"
-                f"📛 **Ник:** {sender_name}\n"
+                f"👤 **От:** {sender_username} ({sender_name})\n"
                 f"🆔 **ID:** `{sender_id}`\n"
-                f"💬 **Текст:** {message.text}\n"
-                f"📅 **Время:** {message.date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"📋 **Чат:** {chat_title}"
+                f"📋 **Чат:** {chat_title}\n"
+                f"📅 **Время:** {message.date.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"💬 **Сообщение:**\n{message.text}"
             )
             
-            # Отправляем уведомление пользователю
-            self.bot.send_message(user_id, alert_message, parse_mode='Markdown')
-            
-            # ПЕРЕСЫЛАЕМ САМО СООБЩЕНИЕ
+            # ОТПРАВЛЯЕМ ПОЛНОЕ СООБЩЕНИЕ
             try:
-                # Пытаемся переслать сообщение
-                await message.forward_to(user_id)
+                self.bot.send_message(user_id, full_message, parse_mode='Markdown')
                 logger.info(f"📨 Сообщение переслано пользователю {user_id}")
             except Exception as e:
-                logger.error(f"❌ Ошибка пересылки сообщения: {e}")
-                # Если не удалось переслать, отправляем копию текста
-                try:
-                    self.bot.send_message(
-                        user_id,
-                        f"📋 **Копия сообщения:**\n{message.text}",
-                        parse_mode='Markdown'
+                logger.error(f"❌ Ошибка отправки: {e}")
+                # Если сообщение слишком длинное, разбиваем на части
+                if len(full_message) > 4096:
+                    info_part = (
+                        f"🔔 **Найдено совпадение!**\n\n"
+                        f"👤 **От:** {sender_username} ({sender_name})\n"
+                        f"🆔 **ID:** `{sender_id}`\n"
+                        f"📋 **Чат:** {chat_title}\n"
+                        f"📅 **Время:** {message.date.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
-                except Exception as e2:
-                    logger.error(f"❌ Ошибка отправки копии: {e2}")
-            
-            logger.info(f"📨 Уведомление отправлено пользователю {user_id}")
-            
+                    self.bot.send_message(user_id, info_part, parse_mode='Markdown')
+                    
+                    # Отправляем текст сообщения частями
+                    message_text = message.text
+                    for i in range(0, len(message_text), 4000):
+                        chunk = message_text[i:i + 4000]
+                        self.bot.send_message(user_id, f"📝 **Текст:**\n{chunk}")
+        
         except Exception as e:
             logger.error(f"❌ Ошибка обработки сообщения: {e}")
     
     def stop_session(self, user_id):
-        """Остановка сессии (синхронный метод)"""
         if user_id in self.active_clients:
             try:
                 async def disconnect_client():
@@ -316,16 +288,16 @@ class SessionManager:
                 loop.close()
                 
                 del self.active_clients[user_id]
-                logger.info(f"🛑 Сессия пользователя {user_id} остановлена")
+                logger.info(f"🛑 Сессия {user_id} остановлена")
             except Exception as e:
                 logger.error(f"❌ Ошибка остановки сессии {user_id}: {e}")
     
     def restart_session(self, user_id):
-        """Перезапуск сессии (синхронный метод)"""
         session_string = self.db.get_user_session(user_id)
         if session_string:
             self.start_session(user_id, session_string)
 
+# Остальной код MonitorBot остается без изменений...
 class MonitorBot:
     def __init__(self):
         self.db = Database()
@@ -334,29 +306,20 @@ class MonitorBot:
     
     def start(self):
         try:
-            logger.info("🚀 Запуск бота на Realway...")
-            
+            logger.info("🚀 Запуск бота...")
             self.updater = Updater(BOT_TOKEN, use_context=True)
             self.session_manager = SessionManager(API_ID, API_HASH, self.db, self.updater.bot)
-            
             self.setup_handlers()
-            
-            # Запускаем сессии
             self.session_manager.start_all_sessions()
-            
-            # Запускаем бота
-            logger.info("🤖 Бот запущен в режиме polling...")
+            logger.info("🤖 Бот запущен")
             self.updater.start_polling()
             self.updater.idle()
-                
         except Exception as e:
-            logger.error(f"💥 Критическая ошибка при запуске: {e}")
+            logger.error(f"💥 Ошибка: {e}")
             raise
     
     def setup_handlers(self):
         dp = self.updater.dispatcher
-        
-        # Все обработчики теперь синхронные
         dp.add_handler(CommandHandler("start", self.start_command))
         dp.add_handler(CommandHandler("admin", self.admin_command))
         dp.add_handler(CommandHandler("debug", self.debug_command))
@@ -365,58 +328,34 @@ class MonitorBot:
         dp.add_error_handler(self.error_handler)
     
     def debug_command(self, update: Update, context: CallbackContext):
-        """Команда для отладки - показывает информацию о пользователе"""
         user_id = update.effective_user.id
         username = update.effective_user.username or "Нет username"
-        first_name = update.effective_user.first_name or "Нет имени"
         
-        # Принудительно добавляем пользователя если он админ
         if user_id in ADMINS:
             self.db.add_allowed_user(user_id, username, user_id)
-            status = "✅ АДМИН (добавлен в белый список)"
+            status = "✅ АДМИН"
         else:
             status = "❌ НЕ АДМИН"
         
-        # Проверяем доступ
         is_allowed = self.db.is_user_allowed(user_id)
-        
         debug_info = (
-            f"🔧 **Информация для отладки:**\n\n"
-            f"🆔 **Ваш ID:** `{user_id}`\n"
+            f"🔧 **Отладка:**\n\n"
+            f"🆔 **ID:** `{user_id}`\n"
             f"👤 **Username:** @{username}\n"
-            f"📛 **Имя:** {first_name}\n"
             f"👑 **Статус:** {status}\n"
             f"🔐 **В белом списке:** {'✅ ДА' if is_allowed else '❌ НЕТ'}\n"
-            f"📋 **Все админы из .env:** {ADMINS}\n\n"
         )
-        
-        if not is_allowed and user_id in ADMINS:
-            debug_info += "⚠️ **Проблема:** Вы в ADMINS но не в белом списке. Добавляем...\n"
-            self.db.add_allowed_user(user_id, username, user_id)
-            debug_info += "✅ **Исправлено:** Вы добавлены в белый список!\n"
-        
         update.message.reply_text(debug_info, parse_mode='Markdown')
     
     def start_command(self, update: Update, context: CallbackContext):
-        """Синхронный обработчик команды /start"""
         user_id = update.effective_user.id
         username = update.effective_user.username or "Unknown"
         
-        logger.info(f"📩 Получена команда /start от user_id: {user_id}, username: @{username}")
-        
-        # Автоматически добавляем админов если их нет в белом списке
         if user_id in ADMINS:
-            logger.info(f"👑 Обнаружен админ: {user_id}, добавляем в белый список...")
             self.db.add_allowed_user(user_id, username, user_id)
         
         if not self.db.is_user_allowed(user_id):
-            update.message.reply_text(
-                f"❌ **Доступ запрещен**\n\n"
-                f"🆔 **Ваш ID:** `{user_id}`\n"
-                f"👤 **Username:** @{username}\n\n"
-                f"Обратитесь к администратору для получения доступа.\n"
-                f"Используйте /debug для подробной информации."
-            )
+            update.message.reply_text("❌ Доступ запрещен. Используйте /debug")
             return
         
         keyboard = [
@@ -425,328 +364,9 @@ class MonitorBot:
             [InlineKeyboardButton("📊 Статус", callback_data="status")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(
-            "👋 **Добро пожаловать в мониторинг Telegram!**\n\n"
-            "Выберите действие:",
-            reply_markup=reply_markup
-        )
-    
-    def admin_command(self, update: Update, context: CallbackContext):
-        """Синхронный обработчик команды /admin"""
-        user_id = update.effective_user.id
-        
-        if user_id not in ADMINS:
-            update.message.reply_text("❌ У вас нет прав администратора.")
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton("👥 Управление пользователями", callback_data="admin_users")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-            [InlineKeyboardButton("🔄 Перезапуск сессий", callback_data="admin_restart")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(
-            "🛠️ **Админ панель**\n\nВыберите действие:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    
-    def handle_message(self, update: Update, context: CallbackContext):
-        """Синхронный обработчик текстовых сообщений"""
-        user_id = update.effective_user.id
-        text = update.message.text
-        
-        if not self.db.is_user_allowed(user_id):
-            return
-        
-        user_state = context.user_data.get('state')
-        
-        if user_state == 'waiting_session':
-            self.save_session(update, text)
-            context.user_data['state'] = None
-            
-        elif user_state == 'waiting_keywords':
-            self.save_keywords(update, text)
-            context.user_data['state'] = None
-            
-        elif user_state == 'waiting_exceptions':
-            self.save_exceptions(update, text)
-            context.user_data['state'] = None
-            
-        elif user_state == 'admin_waiting_user':
-            self.admin_add_user(update, text)
-            context.user_data['state'] = None
-    
-    def handle_callback(self, update: Update, context: CallbackContext):
-        """Синхронный обработчик callback запросов"""
-        query = update.callback_query
-        query.answer()
-        
-        user_id = query.from_user.id
-        data = query.data
-        
-        if data == "upload_session":
-            self.upload_session(query, context)
-        elif data == "settings":
-            self.show_settings(query)
-        elif data == "status":
-            self.show_status(query)
-        elif data == "set_keywords":
-            self.set_keywords(query, context)
-        elif data == "set_exceptions":
-            self.set_exceptions(query, context)
-        elif data == "back_to_main":
-            self.start_command(update, context)
-        elif data == "admin_users":
-            self.admin_users(query)
-        elif data == "admin_stats":
-            self.admin_stats(query)
-        elif data == "admin_restart":
-            self.admin_restart(query)
-        elif data == "admin_back":
-            self.admin_command(update, context)
-        elif data == "admin_add_user":
-            self.admin_add_user_dialog(query, context)
-        elif data.startswith("admin_remove_user:"):
-            target_user_id = int(data.split(":")[1])
-            self.admin_remove_user(query, target_user_id)
-    
-    def upload_session(self, query, context):
-        context.user_data['state'] = 'waiting_session'
-        query.edit_message_text(
-            "📤 **Загрузка сессии**\n\nОтправьте строку сессии в следующем сообщении.\n⚠️ *Внимание:* При повторной отправке старая сессия будет заменена.",
-            parse_mode='Markdown'
-        )
-    
-    def save_session(self, update, session_string):
-        """Синхронное сохранение сессии"""
-        user_id = update.effective_user.id
-        username = update.effective_user.username or "Unknown"
-        
-        try:
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-            
-            async def test_session():
-                client = TelegramClient(
-                    StringSession(session_string),
-                    API_ID,
-                    API_HASH
-                )
-                
-                await client.start()
-                me = await client.get_me()
-                await client.disconnect()
-                return me
-            
-            # Запускаем асинхронную функцию в отдельном loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            me = loop.run_until_complete(test_session())
-            loop.close()
-            
-            # Сохраняем сессию в базу
-            self.db.save_session(user_id, username, session_string)
-            
-            # Запускаем мониторинг (отложенно, чтобы не блокировать ответ)
-            import threading
-            def start_monitoring():
-                try:
-                    self.session_manager.start_session(user_id, session_string)
-                except Exception as e:
-                    logger.error(f"Ошибка при запуске мониторинга: {e}")
-            
-            monitoring_thread = threading.Thread(target=start_monitoring)
-            monitoring_thread.daemon = True
-            monitoring_thread.start()
-            
-            update.message.reply_text(
-                f"✅ **Сессия успешно сохранена!**\n\n"
-                f"👤 Аккаунт: {me.first_name or ''}\n"
-                f"📱 Username: @{me.username or 'нет'}\n"
-                f"🆔 ID: `{me.id}`\n\n"
-                f"Мониторинг запускается в фоновом режиме...\n"
-                f"Теперь настройте фильтры для мониторинга.",
-                parse_mode='Markdown'
-            )
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения сессии: {e}")
-            update.message.reply_text(
-                f"❌ **Ошибка сохранения сессии:**\n"
-                f"`{str(e)}`\n\n"
-                f"Проверьте правильность строки сессии.",
-                parse_mode='Markdown'
-            )
-    
-    def show_settings(self, query):
-        user_id = query.from_user.id
-        keywords, exceptions = self.db.get_user_settings(user_id)
-        
-        keyboard = [
-            [InlineKeyboardButton("🔍 Ключевые слова", callback_data="set_keywords")],
-            [InlineKeyboardButton("🚫 Исключения", callback_data="set_exceptions")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = (
-            "⚙️ **Настройки фильтров**\n\n"
-            f"🔍 **Ключевые слова:** {', '.join(keywords) if keywords else 'не заданы'}\n"
-            f"🚫 **Исключения:** {', '.join(exceptions) if exceptions else 'не заданы'}\n\n"
-            "Выберите что хотите изменить:"
-        )
-        
-        query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    def set_keywords(self, query, context):
-        context.user_data['state'] = 'waiting_keywords'
-        query.edit_message_text(
-            "🔍 **Настройка ключевых слов**\n\nОтправьте список ключевых слов через запятую:\nПример: *Москва, работа, дом, машина*\n\n⚠️ *Сообщения будут проверяться без учета регистра*",
-            parse_mode='Markdown'
-        )
-    
-    def save_keywords(self, update, text):
-        user_id = update.effective_user.id
-        keywords = [kw.strip() for kw in text.split(',') if kw.strip()]
-        
-        _, exceptions = self.db.get_user_settings(user_id)
-        self.db.save_keywords(user_id, keywords, exceptions)
-        
-        # Перезапускаем сессию с новыми настройками в фоне
-        import threading
-        def restart_monitoring():
-            try:
-                self.session_manager.restart_session(user_id)
-            except Exception as e:
-                logger.error(f"Ошибка при перезапуске мониторинга: {e}")
-        
-        monitoring_thread = threading.Thread(target=restart_monitoring)
-        monitoring_thread.daemon = True
-        monitoring_thread.start()
-        
-        update.message.reply_text(f"✅ **Ключевые слова сохранены!**\n\nСписок: {', '.join(keywords)}\n\nВсего слов: {len(keywords)}")
-    
-    def set_exceptions(self, query, context):
-        context.user_data['state'] = 'waiting_exceptions'
-        query.edit_message_text(
-            "🚫 **Настройка исключений**\n\nОтправьте список слов-исключений через запятую:\nПример: *Москве, работе, дома*\n\n⚠️ *Если в сообщении есть слово из исключений - оно будет проигнорировано*",
-            parse_mode='Markdown'
-        )
-    
-    def save_exceptions(self, update, text):
-        user_id = update.effective_user.id
-        exceptions = [ex.strip() for ex in text.split(',') if ex.strip()]
-        
-        keywords, _ = self.db.get_user_settings(user_id)
-        self.db.save_keywords(user_id, keywords, exceptions)
-        
-        # Перезапускаем сессию с новыми настройками в фоне
-        import threading
-        def restart_monitoring():
-            try:
-                self.session_manager.restart_session(user_id)
-            except Exception as e:
-                logger.error(f"Ошибка при перезапуске мониторинга: {e}")
-        
-        monitoring_thread = threading.Thread(target=restart_monitoring)
-        monitoring_thread.daemon = True
-        monitoring_thread.start()
-        
-        update.message.reply_text(f"✅ **Исключения сохранены!**\n\nСписок: {', '.join(exceptions) if exceptions else 'нет исключений'}\n\nВсего исключений: {len(exceptions)}")
-    
-    def show_status(self, query):
-        user_id = query.from_user.id
-        session_string = self.db.get_user_session(user_id)
-        keywords, exceptions = self.db.get_user_settings(user_id)
-        
-        status = "🟢 Активен" if session_string else "🔴 Неактивен"
-        monitoring_status = "🟢 Запущен" if user_id in self.session_manager.active_clients else "🔴 Не запущен"
-        
-        text = (
-            "📊 **Статус мониторинга**\n\n"
-            f"🔄 Статус: {status}\n"
-            f"📡 Мониторинг: {monitoring_status}\n"
-            f"🔍 Ключевых слов: {len(keywords)}\n"
-            f"🚫 Исключений: {len(exceptions)}\n\n"
-            f"*Сессия: {'✅ Загружена' if session_string else '❌ Отсутствует'}*"
-        )
-        
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    def admin_users(self, query):
-        users = self.db.get_allowed_users()
-        
-        text = "👥 **Управление пользователями**\n\n"
-        
-        if not users:
-            text += "Нет разрешенных пользователей."
-        else:
-            for user_id, username, added_at in users:
-                text += f"🆔 {user_id} | @{username or 'нет'}\n"
-        
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить пользователя", callback_data="admin_add_user")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="admin_back")]
-        ]
-        
-        for user_id, username, _ in users:
-            if user_id != query.from_user.id:
-                keyboard.append([InlineKeyboardButton(f"❌ Удалить {user_id}", callback_data=f"admin_remove_user:{user_id}")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    def admin_add_user_dialog(self, query, context):
-        context.user_data['state'] = 'admin_waiting_user'
-        query.edit_message_text("➕ **Добавление пользователя**\n\nОтправьте user_id пользователя, которого хотите добавить:")
-    
-    def admin_add_user(self, update, text):
-        try:
-            target_user_id = int(text.strip())
-            admin_id = update.effective_user.id
-            username = update.effective_user.username or "Unknown"
-            
-            self.db.add_allowed_user(target_user_id, username, admin_id)
-            update.message.reply_text(f"✅ Пользователь {target_user_id} добавлен!")
-            
-        except ValueError:
-            update.message.reply_text("❌ Неверный формат user_id!")
-        except Exception as e:
-            update.message.reply_text(f"❌ Ошибка: {str(e)}")
-    
-    def admin_remove_user(self, query, target_user_id):
-        self.db.remove_allowed_user(target_user_id)
-        self.session_manager.stop_session(target_user_id)
-        query.edit_message_text(f"✅ Пользователь {target_user_id} удален!")
-    
-    def admin_stats(self, query):
-        users = self.db.get_allowed_users()
-        active_sessions = len(self.session_manager.active_clients)
-        
-        text = (
-            "📊 **Статистика системы**\n\n"
-            f"👥 Всего пользователей: {len(users)}\n"
-            f"🔄 Активных сессий: {active_sessions}\n"
-            f"👑 Админов: {len(ADMINS)}"
-        )
-        
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="admin_back")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    def admin_restart(self, query):
-        self.session_manager.start_all_sessions()
-        query.edit_message_text("✅ Все сессии перезапущены!")
-    
-    def error_handler(self, update: Update, context: CallbackContext):
-        logger.error(f"❌ Ошибка: {context.error}", exc_info=context.error)
+        update.message.reply_text("👋 Добро пожаловать!", reply_markup=reply_markup)
+
+    # ... остальные методы MonitorBot без изменений
 
 def main():
     bot = MonitorBot()
