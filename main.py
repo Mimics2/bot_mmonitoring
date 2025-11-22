@@ -173,7 +173,6 @@ class SessionManager:
         self.db = database
         self.bot = bot
         self.active_clients = {}
-        self.loop = asyncio.new_event_loop()
         
     def start_all_sessions(self):
         """Запуск всех сессий (синхронный метод)"""
@@ -190,11 +189,13 @@ class SessionManager:
     def start_session(self, user_id, session_string):
         """Запуск одной сессии (синхронный метод)"""
         try:
-            asyncio.set_event_loop(self.loop)
+            # Создаем новый event loop для этого потока
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
             if user_id in self.active_clients:
                 try:
-                    self.loop.run_until_complete(self.active_clients[user_id].disconnect())
+                    loop.run_until_complete(self.active_clients[user_id].disconnect())
                 except:
                     pass
             
@@ -208,7 +209,8 @@ class SessionManager:
                 self.api_hash
             )
             
-            self.loop.run_until_complete(client.start())
+            # Запускаем клиента
+            loop.run_until_complete(client.start())
             
             keywords, exceptions = self.db.get_user_settings(user_id)
             
@@ -274,7 +276,9 @@ class SessionManager:
         """Остановка сессии (синхронный метод)"""
         if user_id in self.active_clients:
             try:
-                self.loop.run_until_complete(self.active_clients[user_id].disconnect())
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.active_clients[user_id].disconnect())
                 del self.active_clients[user_id]
                 logger.info(f"🛑 Сессия пользователя {user_id} остановлена")
             except Exception as e:
@@ -319,7 +323,7 @@ class MonitorBot:
         # Все обработчики теперь синхронные
         dp.add_handler(CommandHandler("start", self.start_command))
         dp.add_handler(CommandHandler("admin", self.admin_command))
-        dp.add_handler(CommandHandler("debug", self.debug_command))  # Команда для отладки
+        dp.add_handler(CommandHandler("debug", self.debug_command))
         dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
         dp.add_handler(CallbackQueryHandler(self.handle_callback))
         dp.add_error_handler(self.error_handler)
@@ -489,30 +493,44 @@ class MonitorBot:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             
-            # Создаем временный event loop для асинхронных операций
+            async def test_session():
+                client = TelegramClient(
+                    StringSession(session_string),
+                    API_ID,
+                    API_HASH
+                )
+                
+                await client.start()
+                me = await client.get_me()
+                await client.disconnect()
+                return me
+            
+            # Запускаем асинхронную функцию в отдельном loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
-            client = TelegramClient(
-                StringSession(session_string),
-                API_ID,
-                API_HASH
-            )
-            
-            loop.run_until_complete(client.start())
-            me = loop.run_until_complete(client.get_me())
-            loop.run_until_complete(client.disconnect())
+            me = loop.run_until_complete(test_session())
+            loop.close()
             
             self.db.save_session(user_id, username, session_string)
             self.session_manager.start_session(user_id, session_string)
             
             update.message.reply_text(
-                f"✅ **Сессия успешно сохранена!**\n\n👤 Аккаунт: {me.first_name or ''} (@{me.username or 'нет'})\n🆔 ID: `{me.id}`\n\nТеперь настройте фильтры для мониторинга.",
+                f"✅ **Сессия успешно сохранена!**\n\n"
+                f"👤 Аккаунт: {me.first_name or ''}\n"
+                f"📱 Username: @{me.username or 'нет'}\n"
+                f"🆔 ID: `{me.id}`\n\n"
+                f"Теперь настройте фильтры для мониторинга.",
                 parse_mode='Markdown'
             )
             
         except Exception as e:
-            update.message.reply_text(f"❌ **Ошибка сохранения сессии:**\n{str(e)}")
+            logger.error(f"❌ Ошибка сохранения сессии: {e}")
+            update.message.reply_text(
+                f"❌ **Ошибка сохранения сессии:**\n"
+                f"`{str(e)}`\n\n"
+                f"Проверьте правильность строки сессии.",
+                parse_mode='Markdown'
+            )
     
     def show_settings(self, query):
         user_id = query.from_user.id
