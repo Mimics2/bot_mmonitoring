@@ -263,17 +263,42 @@ class SessionManager:
             sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'title', '') or "Неизвестно"
             sender_id = sender.id if sender else "Неизвестно"
             
+            # Получаем информацию о чате
+            chat = await event.get_chat()
+            chat_title = getattr(chat, 'title', '') or getattr(chat, 'username', '') or "Личные сообщения"
+            
+            # Форматируем сообщение для бота
             alert_message = (
                 f"🔔 **Найдено совпадение!**\n\n"
                 f"👤 **Пользователь:** {sender_username}\n"
                 f"📛 **Ник:** {sender_name}\n"
                 f"🆔 **ID:** `{sender_id}`\n"
-                f"💬 **Текст:** {message.text[:500]}\n"
-                f"📅 **Время:** {message.date.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"💬 **Текст:** {message.text}\n"
+                f"📅 **Время:** {message.date.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📋 **Чат:** {chat_title}"
             )
             
+            # Отправляем уведомление пользователю
             self.bot.send_message(user_id, alert_message, parse_mode='Markdown')
-            logger.info(f"📨 Отправлено уведомление пользователю {user_id}")
+            
+            # ПЕРЕСЫЛАЕМ САМО СООБЩЕНИЕ
+            try:
+                # Пытаемся переслать сообщение
+                await message.forward_to(user_id)
+                logger.info(f"📨 Сообщение переслано пользователю {user_id}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка пересылки сообщения: {e}")
+                # Если не удалось переслать, отправляем копию текста
+                try:
+                    self.bot.send_message(
+                        user_id,
+                        f"📋 **Копия сообщения:**\n{message.text}",
+                        parse_mode='Markdown'
+                    )
+                except Exception as e2:
+                    logger.error(f"❌ Ошибка отправки копии: {e2}")
+            
+            logger.info(f"📨 Уведомление отправлено пользователю {user_id}")
             
         except Exception as e:
             logger.error(f"❌ Ошибка обработки сообщения: {e}")
