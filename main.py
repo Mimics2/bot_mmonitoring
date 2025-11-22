@@ -180,49 +180,47 @@ class SessionManager:
         try:
             # Останавливаем существующую сессию если есть
             if user_id in self.active_clients:
-                try:
-                    self.stop_session(user_id)
-                except:
-                    pass
+                self.stop_session(user_id)
             
             from telethon import TelegramClient
             from telethon.sessions import StringSession
             from telethon import events
             
-            # Создаем асинхронную функцию для запуска клиента
-            async def start_client():
-                client = TelegramClient(
-                    StringSession(session_string),
-                    self.api_id,
-                    self.api_hash
-                )
-                await client.start()
-                return client
-            
-            # Запускаем клиента
+            # Создаем отдельный loop для этой сессии
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            client = loop.run_until_complete(start_client())
+            
+            client = TelegramClient(
+                StringSession(session_string),
+                self.api_id,
+                self.api_hash,
+                loop=loop
+            )
+            
+            # Запускаем клиента
+            loop.run_until_complete(client.start())
             
             # Получаем настройки пользователя
             keywords, exceptions = self.db.get_user_settings(user_id)
             
-            # Создаем асинхронный обработчик сообщений
+            # Настраиваем обработчик
             @client.on(events.NewMessage)
             async def handler(event):
                 await self.handle_message(user_id, event, keywords, exceptions)
             
-            self.active_clients[user_id] = client
+            self.active_clients[user_id] = {
+                'client': client,
+                'loop': loop
+            }
+            
             logger.info(f"✅ Сессия для {user_id} запущена")
             
         except Exception as e:
             logger.error(f"❌ Ошибка запуска сессии для {user_id}: {e}")
     
     async def handle_message(self, user_id, event, keywords, exceptions):
-        """Обработка сообщений с ПЕРЕСЫЛКОЙ"""
+        """Обработка сообщений"""
         try:
-            from telethon import events
-            
             message = event.message
             if not message.text:
                 return
@@ -283,7 +281,7 @@ class SessionManager:
                     for i in range(0, len(message_text), 4000):
                         chunk = message_text[i:i + 4000]
                         self.bot.send_message(user_id, f"📝 **Текст:**\n{chunk}")
-        
+                
         except Exception as e:
             logger.error(f"❌ Ошибка обработки сообщения: {e}")
     
@@ -291,18 +289,27 @@ class SessionManager:
         """Остановка сессии"""
         if user_id in self.active_clients:
             try:
-                async def disconnect_client():
-                    await self.active_clients[user_id].disconnect()
+                client_data = self.active_clients[user_id]
+                client = client_data['client']
+                loop = client_data['loop']
                 
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(disconnect_client())
-                loop.close()
+                # Останавливаем клиента
+                if client.is_connected():
+                    loop.run_until_complete(client.disconnect())
+                
+                # Закрываем loop
+                if not loop.is_closed():
+                    loop.stop()
+                    loop.close()
                 
                 del self.active_clients[user_id]
                 logger.info(f"🛑 Сессия {user_id} остановлена")
+                
             except Exception as e:
                 logger.error(f"❌ Ошибка остановки сессии {user_id}: {e}")
+                # Принудительно удаляем даже при ошибке
+                if user_id in self.active_clients:
+                    del self.active_clients[user_id]
     
     def restart_session(self, user_id):
         """Перезапуск сессии"""
@@ -321,7 +328,7 @@ class MonitorBot:
         try:
             logger.info("🚀 Запуск бота...")
             
-            # Создаем Updater вместо Application
+            # Создаем Updater
             self.updater = Updater(BOT_TOKEN, use_context=True)
             self.session_manager = SessionManager(API_ID, API_HASH, self.db, self.updater.bot)
             
